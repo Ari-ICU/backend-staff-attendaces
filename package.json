@@ -1,0 +1,25 @@
+{
+  "name": "check-permission-employee",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "author": "thoeurn ratha",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express-rate-limit": "^8.0.1",
+    "joi": "^18.0.1",
+    "multer": "^2.0.2",
+    "node-cache": "^5.1.2",
+    "redis": "^5.8.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
