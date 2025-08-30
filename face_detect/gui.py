@@ -1,405 +1,23 @@
-import cv2
-import numpy as np
-import face_recognition
-import asyncio
-import aiohttp
-import logging
-import threading
-from typing import List, Tuple, Dict, Optional
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 import tkinter as tk
-from tkinter import ttk, messagebox, font
+from tkinter import ttk, messagebox
 import tkinter.font as tkfont
 from PIL import Image, ImageTk
-import warnings
-import time
+import cv2
+import asyncio
 import queue
-from concurrent.futures import ThreadPoolExecutor
-import json
+import threading
+import time
 import os
-from dotenv import load_dotenv
-from scipy.spatial import cKDTree
-import pyttsx3
 import pygame
-
-load_dotenv()
-
-warnings.filterwarnings("ignore", category=UserWarning, module="face_recognition_models")
+import pyttsx3
+import logging
+from config import Config
+from face_detector import FaceDetector
+from scipy.io import wavfile
+import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-@dataclass
-class Config:
-    staff_api_url: str = os.getenv('STAFF_API_URL', 'http://localhost:5000/api/staff')
-    attendance_url: str = os.getenv('ATTENDANCE_URL', 'http://localhost:5000/api/attendance')
-    tolerance: float = 0.5
-    frame_resize_scale: float = 0.25
-    base_process_frames: int = 3
-    max_image_download_retries: int = 3
-    detection_model: str = 'hog'
-    refresh_interval: int = 30
-    default_attendance_type: str = 'check-in'
-    attendance_cooldown: timedelta = timedelta(seconds=120)
-    cache_file: str = 'face_cache.json'
-    max_face_distance: float = 0.5
-    recognition_threshold: int = 3
-    sound_debounce_interval: float = 8.0
-    max_sound_queue_size: int = 10
-    min_fps_threshold: float = 15.0
-    sound_directory: str = 'sounds'
-    voice_id: int = 0
-
-class PerformanceMonitor:
-    def __init__(self):
-        self.frame_times = []
-        self.detection_times = []
-        self.max_samples = 20
-        self.process_frames = Config.base_process_frames
-
-    def add_frame_time(self, time_ms: float):
-        self.frame_times.append(time_ms)
-        if len(self.frame_times) > self.max_samples:
-            self.frame_times.pop(0)
-
-    def add_detection_time(self, time_ms: float):
-        self.detection_times.append(time_ms)
-        if len(self.detection_times) > self.max_samples:
-            self.detection_times.pop(0)
-
-    def get_avg_fps(self) -> float:
-        return 1000 / (sum(self.frame_times) / len(self.frame_times)) if self.frame_times else 0
-
-    def get_avg_detection_time(self) -> float:
-        return sum(self.detection_times) / len(self.detection_times) if self.detection_times else 0
-
-    def update_process_frames(self):
-        fps = self.get_avg_fps()
-        if fps < Config.min_fps_threshold:
-            self.process_frames = min(self.process_frames + 1, 6)
-        elif fps > Config.min_fps_threshold * 1.5:
-            self.process_frames = max(self.process_frames - 1, 2)
-
-class FaceCache:
-    def __init__(self, cache_file: str, cache_ttl: int = 86400):
-        self.cache_file = cache_file
-        self.cache_ttl = cache_ttl
-        self.cache = {}
-        self.last_save = 0
-        self.save_interval = 300
-        self.load_cache()
-
-    def load_cache(self):
-        try:
-            if os.path.exists(self.cache_file):
-                with open(self.cache_file, 'r') as f:
-                    data = json.load(f)
-                    now = datetime.now()
-                    for staff_id, cache_data in data.items():
-                        cached_at = datetime.fromisoformat(cache_data.get('cached_at', '1970-01-01'))
-                        if (now - cached_at).total_seconds() < self.cache_ttl:
-                            if 'encoding' in cache_data:
-                                cache_data['encoding'] = np.array(cache_data['encoding'], dtype=np.float32)
-                            self.cache[staff_id] = cache_data
-                    logger.info(f"Loaded {len(self.cache)} valid cached encodings")
-        except Exception as e:
-            logger.error(f"Error loading cache: {e}")
-
-    def save_cache(self):
-        current_time = time.time()
-        if current_time - self.last_save < self.save_interval:
-            return
-        try:
-            cache_to_save = {
-                staff_id: {
-                    **cache_data,
-                    'encoding': cache_data['encoding'].tolist() if 'encoding' in cache_data else None
-                } for staff_id, cache_data in self.cache.items()
-            }
-            with open(self.cache_file, 'w') as f:
-                json.dump(cache_to_save, f)
-            self.last_save = current_time
-            logger.info("Cache saved successfully")
-        except Exception as e:
-            logger.error(f"Error saving cache: {e}")
-
-    def get_encoding(self, staff_id: str, image_url: str) -> Optional[np.ndarray]:
-        entry = self.cache.get(staff_id)
-        if entry and entry.get('image_url') == image_url:
-            return entry.get('encoding')
-        return None
-
-    def set_encoding(self, staff_id: str, image_url: str, encoding: np.ndarray):
-        self.cache[staff_id] = {
-            'image_url': image_url,
-            'encoding': encoding.astype(np.float32),
-            'cached_at': datetime.now().isoformat()
-        }
-
-class FaceDetector:
-    def __init__(self, config: Config = Config()):
-        self.config = config
-        self.known_encodings: List[np.ndarray] = []
-        self.known_names: List[str] = []
-        self.known_ids: List[str] = []
-        self.staff_list: List[Dict] = []
-        self.lock = threading.Lock()
-        self.last_staff_ids: set = set()
-        self.running = False
-        self.recently_recorded: Dict[str, float] = {}
-        self.cache = FaceCache(config.cache_file)
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        self.recognition_buffer: Dict[str, int] = {}
-        self.performance = PerformanceMonitor()
-        self.encoding_tree: Optional[cKDTree] = None
-
-    def _build_encoding_tree(self):
-        if self.known_encodings:
-            self.encoding_tree = cKDTree(np.array(self.known_encodings, dtype=np.float32))
-        else:
-            self.encoding_tree = None
-
-    async def initialize(self):
-        await self.refresh_staff_data()
-        self.running = True
-
-    async def fetch_staff(self) -> List[Dict]:
-        async with aiohttp.ClientSession() as session:
-            for attempt in range(self.config.max_image_download_retries):
-                try:
-                    async with session.get(self.config.staff_api_url, timeout=10) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
-                        staff = data.get('data', {}).get('staff', []) if isinstance(data, dict) else []
-                        logger.info(f"Fetched {len(staff)} staff members")
-                        return staff
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt < self.config.max_image_download_retries - 1:
-                        await asyncio.sleep(0.5 * (2 ** attempt))
-        logger.error(f"Failed to fetch staff data after {self.config.max_image_download_retries} attempts")
-        return []
-
-    async def load_image_optimized(self, url: str) -> Optional[np.ndarray]:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            for attempt in range(self.config.max_image_download_retries):
-                try:
-                    async with session.get(url) as resp:
-                        resp.raise_for_status()
-                        content = await resp.read()
-                        return await asyncio.get_event_loop().run_in_executor(self.executor, self._decode_image, content)
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-                    if attempt < self.config.max_image_download_retries - 1:
-                        await asyncio.sleep(0.5 * attempt)
-        return None
-
-    def _decode_image(self, content: bytes) -> Optional[np.ndarray]:
-        try:
-            arr = np.frombuffer(content, dtype=np.uint8)
-            image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if image is None:
-                return None
-            height, width = image.shape[:2]
-            scale = min(640 / width, 480 / height)
-            if scale < 1:
-                image = cv2.resize(image, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
-            return image
-        except Exception as e:
-            logger.error(f"Error decoding image: {e}")
-            return None
-
-    async def process_image_optimized(self, staff: Dict) -> Tuple[Optional[np.ndarray], Optional[str], Optional[str]]:
-        image_url = staff.get('imageUrl')
-        staff_id = staff.get('_id')
-        name = staff.get('name')
-        if not staff_id or not image_url:
-            logger.warning(f"Missing ID or image for staff {name}")
-            return None, None, None
-        cached_encoding = self.cache.get_encoding(staff_id, image_url)
-        if cached_encoding is not None:
-            return cached_encoding, name, staff_id
-        image = await self.load_image_optimized(image_url)
-        if image is None:
-            return None, None, None
-        encoding = await asyncio.get_event_loop().run_in_executor(self.executor, self._extract_face_encoding, image)
-        if encoding is not None:
-            self.cache.set_encoding(staff_id, image_url, encoding)
-        return encoding, name, staff_id
-
-    def _extract_face_encoding(self, image: np.ndarray) -> Optional[np.ndarray]:
-        try:
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            encodings = face_recognition.face_encodings(rgb_image, model='small', num_jitters=1)
-            return encodings[0] if encodings else None
-        except Exception as e:
-            logger.error(f"Error extracting face encoding: {e}")
-            return None
-
-    async def refresh_staff_data(self):
-        staff_list = await self.fetch_staff()
-        if not staff_list:
-            return
-        new_staff_ids = {s.get('_id') for s in staff_list if s.get('_id')}
-        if new_staff_ids == self.last_staff_ids and self.known_encodings:
-            logger.info("Staff data unchanged")
-            return
-        batch_size = 8
-        new_encodings, new_names, new_ids = [], [], []
-        for i in range(0, len(staff_list), batch_size):
-            batch = staff_list[i:i + batch_size]
-            results = await asyncio.gather(*[self.process_image_optimized(s) for s in batch], return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                enc, name, sid = result
-                if enc is not None:
-                    new_encodings.append(enc)
-                    new_names.append(name)
-                    new_ids.append(sid)
-        with self.lock:
-            self.known_encodings = new_encodings
-            self.known_names = new_names
-            self.known_ids = new_ids
-            self.staff_list = staff_list
-            self.last_staff_ids = new_staff_ids
-            self._build_encoding_tree()
-        self.cache.save_cache()
-        logger.info(f"Staff data updated: {len(self.known_encodings)} encodings loaded")
-
-    async def background_refresh(self):
-        while self.running:
-            try:
-                await self.refresh_staff_data()
-                await asyncio.sleep(self.config.refresh_interval)
-            except Exception as e:
-                logger.error(f"Background refresh error: {e}")
-                await asyncio.sleep(5)
-
-    async def record_attendance(self, staff_id: str, name: str, type: str = None, note: str = None):
-        """
-        Record attendance for a staff member while respecting cooldown per type.
-        Resets cooldown for a type when switching between types.
-        """
-        record_type = type or self.config.default_attendance_type
-        valid_types = ['check-in', 'check-out', 'leave']
-
-        if record_type not in valid_types:
-            logger.error(f"Invalid attendance type: {record_type}")
-            return False
-
-        now = time.time()
-        buffer_key = f"{staff_id}_{record_type}"
-
-        # Reset cooldown for other types when switching type
-        for key in list(self.recently_recorded.keys()):
-            if key.startswith(f"{staff_id}_") and key != buffer_key:
-                self.recently_recorded[key] = 0
-
-        # Check cooldown for this type
-        cooldown_seconds = self.config.attendance_cooldown.total_seconds()
-        last_recorded = self.recently_recorded.get(buffer_key, 0)
-        if now - last_recorded < cooldown_seconds:
-            logger.info(f"⚠️ Cooldown active for {name} ({record_type})")
-            return False
-
-        # Update last recorded time
-        self.recently_recorded[buffer_key] = now
-
-        # Prepare payload
-        payload = {
-            "staffId": staff_id,
-            "name": name,
-            "type": record_type,
-            "timestamp": datetime.now().isoformat()
-        }
-        if note:
-            payload["note"] = note
-
-        # Send attendance data
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-                async with session.post(self.config.attendance_url, json=payload) as resp:
-                    if resp.status == 201:
-                        logger.info(f"✓ Attendance recorded: {name} - {record_type}")
-                        return True
-                    else:
-                        text = await resp.text()
-                        logger.error(f"❌ POST failed: {resp.status} - {text}")
-                        return False
-        except Exception as e:
-            logger.error(f"❌ Error recording attendance for {name}: {e}")
-            return False
-
-    async def detect_and_check_optimized(self, frame: np.ndarray, attendance_type: str) -> Tuple[np.ndarray, List[Dict]]:
-        start_time = time.time()
-        small_frame = cv2.resize(frame, (0, 0), fx=self.config.frame_resize_scale, fy=self.config.frame_resize_scale)
-        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-        face_locations = face_recognition.face_locations(rgb_small_frame, model=self.config.detection_model)
-
-        if not face_locations:
-            self.performance.add_detection_time((time.time() - start_time) * 1000)
-            return frame, []
-
-        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations, num_jitters=1)
-        allowed_staff = []
-
-        with self.lock:
-            if not self.known_encodings:
-                return self._draw_unknown_faces(frame, face_locations), []
-
-            for face_encoding, (top, right, bottom, left) in zip(face_encodings, face_locations):
-                if self.encoding_tree:
-                    dist, idx = self.encoding_tree.query(face_encoding, k=1)
-                    dist = dist[0] if isinstance(dist, np.ndarray) else dist
-                    idx = idx[0] if isinstance(idx, np.ndarray) else idx
-
-                    if dist <= self.config.max_face_distance:
-                        name = self.known_names[idx]
-                        staff_id = self.known_ids[idx]
-                        confidence = 1 - dist
-                        buffer_key = f"{staff_id}_{attendance_type}"
-
-                        # Reset recognition buffer for other types
-                        for key in list(self.recognition_buffer.keys()):
-                            if key.startswith(f"{staff_id}_") and key != buffer_key:
-                                self.recognition_buffer[key] = 0
-
-                        # Increment current type buffer
-                        self.recognition_buffer[buffer_key] = self.recognition_buffer.get(buffer_key, 0) + 1
-
-                        if self.recognition_buffer[buffer_key] >= self.config.recognition_threshold:
-                            allowed_staff.append({
-                                "name": name,
-                                "type": attendance_type,
-                                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                "confidence": f"{confidence:.2f}",
-                                "staff_id": staff_id
-                            })
-                            # Record attendance
-                            asyncio.create_task(self.record_attendance(staff_id, name, type=attendance_type))
-                            self.recognition_buffer[buffer_key] = 0
-
-                        self._draw_face_box(frame, (top, right, bottom, left), name, confidence, (0, 255, 0))
-                    else:
-                        self._draw_face_box(frame, (top, right, bottom, left), "Unknown", 0, (0, 0, 255))
-                else:
-                    self._draw_face_box(frame, (top, right, bottom, left), "Unknown", 0, (0, 0, 255))
-
-        self.performance.add_detection_time((time.time() - start_time) * 1000)
-        return frame, allowed_staff
-
-    def _draw_face_box(self, frame: np.ndarray, location: Tuple[int, int, int, int], name: str, confidence: float, color: Tuple[int, int, int]):
-        top, right, bottom, left = [int(coord / self.config.frame_resize_scale) for coord in location]
-        cv2.rectangle(frame, (left, top), (right, bottom), color, 1)
-        label = f"{name} ({confidence:.0%})" if confidence > 0 else name
-        cv2.putText(frame, label, (left + 5, top - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
-    def _draw_unknown_faces(self, frame: np.ndarray, face_locations: List[Tuple[int, int, int, int]]) -> np.ndarray:
-        for (top, right, bottom, left) in face_locations:
-            self._draw_face_box(frame, (top, right, bottom, left), "Loading...", 0, (255, 255, 0))
-        return frame
 
 class ModernFaceRecognitionGUI:
     def __init__(self, root):
@@ -407,40 +25,29 @@ class ModernFaceRecognitionGUI:
         self.root.title("✨ Face Recognition Attendance System")
         self.root.geometry("1000x850")
         self.dark_mode = False
+        self.latest_detections = {}  # Dictionary to store the most recent detection per staff_id
 
-        # Initialize pygame mixer
         pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
-
-        # Create sounds directory if not exists
         os.makedirs('sounds', exist_ok=True)
-
-        # Generate default sounds if not exist
         self._generate_default_sounds_if_missing()
 
-        # TTS Engine Setup (Professional Voice)
         self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('rate', 100)     # Natural speaking pace
+        self.tts_engine.setProperty('rate', 100)
         self.tts_engine.setProperty('volume', 0.9)
-
-        # Prefer female voice (Microsoft Zira or similar)
         voices = self.tts_engine.getProperty('voices')
         for v in voices:
-            if "Samantha" in v.name:
+            if "Zira" in v.name or "Samantha" in v.name:
                 self.tts_engine.setProperty('voice', v.id)
-                print(f"Using voice: {v.name}")
+                logger.info(f"Using voice: {v.name}")
                 break
         else:
-            # Fallback to first voice if Samantha is not found
             self.tts_engine.setProperty('voice', voices[0].id)
-            print(f"Samantha not found, using fallback voice: {voices[0].name}")
+            logger.info(f"Fallback voice: {voices[0].name}")
 
-        # Sound Queue & Control
         self.sound_queue = queue.PriorityQueue(maxsize=Config.max_sound_queue_size)
         self.sound_thread = None
         self.sound_running = False
         self.last_sound_times = {}
-
-        # Volume control
         self.volume_var = tk.DoubleVar(value=0.9)
 
         self.style = ttk.Style()
@@ -482,30 +89,24 @@ class ModernFaceRecognitionGUI:
         self.apply_light_theme()
 
     def _generate_default_sounds_if_missing(self):
-        """Generate soft professional chime sounds if not present."""
-        import numpy as np
-
         sample_rate = 22050
-        duration = 0.6  # seconds
+        duration = 0.6
         t = np.linspace(0, duration, int(sample_rate * duration))
-
         sounds = {
-            'check-in.wav': np.sin(2 * np.pi * 600 * t) * np.exp(-t * 3),  # Rising tone
-            'check-out.wav': np.sin(2 * np.pi * 400 * t) * np.exp(-t * 3),  # Falling tone
-            'leave.wav': np.sin(2 * np.pi * 500 * t) * np.exp(-t * 4),     # Neutral tone
+            'check-in.wav': np.sin(2 * np.pi * 600 * t) * np.exp(-t * 3),
+            'check-out.wav': np.sin(2 * np.pi * 400 * t) * np.exp(-t * 3),
         }
-
         for fname, wave in sounds.items():
             path = os.path.join('sounds', fname)
             if not os.path.exists(path):
                 try:
-                    stereo_wave = np.column_stack([wave, wave])  # Stereo
+                    stereo_wave = np.column_stack([wave, wave])
                     stereo_wave = (stereo_wave * 32767).astype(np.int16)
-                    pygame.mixer.Sound(buffer=stereo_wave).save(path)
+                    wavfile.write(path, sample_rate, stereo_wave)
                     logger.info(f"✅ Generated default sound: {path}")
                 except Exception as e:
                     logger.warning(f"Could not generate {path}: {e}")
-                    
+
     def apply_light_theme(self):
         self.root.configure(bg=self.bg_light)
         self.style.configure('TFrame', background=self.bg_light)
@@ -622,7 +223,7 @@ class ModernFaceRecognitionGUI:
         self.att_card = ttk.Frame(left_panel, style='Card.TFrame', padding=20)
         self.att_card.grid(row=1, column=0, sticky="ew", pady=15)
         ttk.Label(self.att_card, text="📝 Attendance Type", font=('Inter', 12, 'bold'), style='Card.TLabel').pack(anchor="w", pady=(0, 15))
-        self.type_combo = ttk.Combobox(self.att_card, textvariable=self.attendance_type_var, values=["check-in", "check-out", "leave"], state="readonly", font=('Inter', 11))
+        self.type_combo = ttk.Combobox(self.att_card, textvariable=self.attendance_type_var, values=["check-in", "check-out"], state="readonly", font=('Inter', 11))
         self.type_combo.pack(fill="x", pady=6)
         self.type_combo.current(0)
         self.create_tooltip(self.type_combo, "Select the type of attendance to record")
@@ -698,8 +299,8 @@ class ModernFaceRecognitionGUI:
             self.status_var.set("🔄 Refreshing staff data...")
             self.start_button.config(state="disabled")
             asyncio.run_coroutine_threadsafe(self.detector.refresh_staff_data(), self.async_loop)
-            self.root.after(3000, lambda: self.start_button.config(state="normal"))
-            self.root.after(3000, lambda: self.status_var.set("🟢 System Idle"))
+            self.root.after(5000, lambda: self.start_button.config(state="normal"))
+            self.root.after(5000, lambda: self.status_var.set("🟢 System Idle"))
 
     def clear_cache(self):
         self.detector.cache.cache.clear()
@@ -708,17 +309,12 @@ class ModernFaceRecognitionGUI:
         self.root.after(2000, lambda: self.status_var.set("🟢 System Idle"))
 
     def process_sound_queue(self):
-        """Background thread to play sounds professionally."""
         while self.sound_running:
             try:
                 priority, (name, attendance_type, staff_id) = self.sound_queue.get(timeout=1.0)
-
-                # Construct sound path: personal > generic
                 personal_sound = os.path.join(self.config.sound_directory, f"staff_{staff_id}_{attendance_type}.wav")
                 generic_sound = os.path.join(self.config.sound_directory, f"{attendance_type}.wav")
-
                 sound_file = personal_sound if os.path.exists(personal_sound) else generic_sound
-
                 if os.path.exists(sound_file):
                     try:
                         pygame.mixer.music.load(sound_file)
@@ -732,62 +328,39 @@ class ModernFaceRecognitionGUI:
                 else:
                     logger.warning(f"Sound file not found: {sound_file}")
                     self._play_tts_fallback(name, attendance_type)
-
                 self.sound_queue.task_done()
-
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.error(f"Sound queue error: {e}")
-                
+
     def _play_tts_fallback(self, name: str, attendance_type: str):
-        """
-        Professional voice announcements using Microsoft David.
-        Dynamically handles all attendance types.
-        """
-        # Define TTS messages for known attendance types
         attendance_messages = {
             "check-in": f"Good morning, {name}. You're checked in. Have a productive day.",
             "check-out": f"Goodbye, {name}. You're checked out. Thank you for your work today.",
-            "leave": f"{name}, your leave has been recorded. Take care and see you soon.",
-            "break": f"{name}, your break has started. Enjoy your time.",
-            "overtime": f"{name}, your overtime has been recorded. Keep up the great work."
         }
-
-        # Get message or fallback
         message = attendance_messages.get(
             attendance_type,
             f"{name}, your attendance type '{attendance_type.replace('-', ' ')}' has been recorded."
         )
-
         try:
-            # Log voice info and message
             current_voice = self.tts_engine.getProperty('voice')
             logger.info(f"🔊 TTS ({current_voice}): {message}")
-
-            # Speak the message
             self.tts_engine.say(message)
             self.tts_engine.runAndWait()
         except Exception as e:
             logger.error(f"TTS playback failed: {e}")
 
     def queue_sound_alert(self, name: str, attendance_type: str, staff_id: str):
-        """Queue a sound alert with debounce and priority."""
         current_type = self.attendance_type_var.get()
-        if current_type not in ["check-in", "check-out", "leave"]:
+        if current_type not in ["check-in", "check-out"]:
             return
-
         now = time.time()
         key = f"{staff_id}_{current_type}"
-
-        # Debounce: prevent repeat within cooldown
         if now - self.last_sound_times.get(key, 0) < self.config.sound_debounce_interval:
             return
-
         try:
-            # Priority: check-in > check-out > leave
-            priority = {"check-in": 1, "check-out": 2, "leave": 3}.get(current_type, 2)
-
+            priority = {"check-in": 1, "check-out": 2}.get(current_type, 2)
             if not self.sound_queue.full():
                 self.sound_queue.put((priority, (name, current_type, staff_id)))
                 self.last_sound_times[key] = now
@@ -805,12 +378,9 @@ class ModernFaceRecognitionGUI:
             self.stop_button.config(state="normal")
             self.status_var.set("🎥 Camera starting...")
             self.canvas.delete(self.canvas_loading)
-
             os.makedirs(self.config.sound_directory, exist_ok=True)
-
             self.sound_thread = threading.Thread(target=self.process_sound_queue, daemon=True)
             self.sound_thread.start()
-
             self.async_loop = asyncio.new_event_loop()
             self.thread = threading.Thread(target=self.run_async_loop, args=(self.async_loop,), daemon=True)
             self.thread.start()
@@ -843,7 +413,7 @@ class ModernFaceRecognitionGUI:
             loop.run_until_complete(self.main_loop())
         except Exception as e:
             logger.error(f"Async loop error: {e}")
-            self.root.after(0, lambda: self.status_var.set(f"❌ Error: {str(e)}"))
+            self.root.after(0, lambda error=e: self.status_var.set(f"❌ Error: {str(error)}"))
         finally:
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
@@ -883,7 +453,7 @@ class ModernFaceRecognitionGUI:
                 await asyncio.sleep(0.01)
         except Exception as e:
             logger.error(f"Main loop error: {e}")
-            self.root.after(0, lambda: self.status_var.set(f"❌ Error: {str(e)}"))
+            self.root.after(0, lambda error=e: self.status_var.set(f"❌ Error: {str(error)}"))
         finally:
             if self.cap:
                 self.cap.release()
@@ -924,16 +494,35 @@ class ModernFaceRecognitionGUI:
 
     def update_detection_display(self, staff_data):
         try:
-            for i, entry in enumerate(staff_data):
+            # Update the latest_detections dictionary with new detections
+            for entry in staff_data:
+                staff_id = entry.get('staff_id')
+                if staff_id:
+                    self.latest_detections[staff_id] = {
+                        'name': entry.get('name', 'Unknown'),
+                        'type': entry.get('type', '').title(),
+                        'timestamp': entry.get('timestamp', ''),
+                        'confidence': entry.get('confidence', '')
+                    }
+
+            # Clear the Treeview
+            self.detection_tree.delete(*self.detection_tree.get_children())
+
+            # Add the latest detection for each staff member
+            for i, (staff_id, entry) in enumerate(self.latest_detections.items()):
                 tag = 'evenrow' if i % 2 == 0 else 'oddrow'
-                self.detection_tree.insert('', 0, values=(
+                self.detection_tree.insert('', 'end', values=(
                     entry['name'],
-                    entry['type'].title(),
+                    entry['type'],
                     entry['timestamp'],
                     entry['confidence']
                 ), tags=(tag,))
-            for child in self.detection_tree.get_children()[15:]:
-                self.detection_tree.delete(child)
+
+            # Limit to the most recent 15 staff members
+            items = self.detection_tree.get_children()
+            for item in items[15:]:
+                self.detection_tree.delete(item)
+
         except Exception as e:
             logger.error(f"Detection display error: {e}")
 
@@ -971,22 +560,3 @@ class ModernFaceRecognitionGUI:
         except Exception as e:
             logger.error(f"Shutdown error: {e}")
             self.root.destroy()
-
-def main():
-    root = tk.Tk()
-    app = ModernFaceRecognitionGUI(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() // 2) - (root.winfo_width() // 2)
-    y = (root.winfo_screenheight() // 2) - (root.winfo_height() // 2)
-    root.geometry(f"+{x}+{y}")
-    try:
-        root.mainloop()
-    except KeyboardInterrupt:
-        logger.info("Application terminated by user.")
-    except Exception as e:
-        logger.error(f"Application crashed: {e}")
-        messagebox.showerror("Critical Error", f"System error: {str(e)}")
-
-if __name__ == "__main__":
-    main()

@@ -55,7 +55,7 @@ class StaffService {
                 throw new Error('Invalid staff ID');
             }
             if (file) {
-                data.imageUrl = `http://localhost:3000/uploads/${file.filename}`;
+                data.imageUrl = `http://localhost:5000/uploads/${file.filename}`;
                 const oldStaff = await Staff.findById(id);
                 if (oldStaff && oldStaff.imageUrl) {
                     const oldImagePath = path.join(
